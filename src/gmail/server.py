@@ -396,45 +396,21 @@ class GmailService:
                     logger.error(f"Error trashing email {valid_email_ids[0]}: {str(e)}")
                     return f"Failed to move email to trash: {str(e)}"
             
-            # For multiple emails, use batch processing with throttling
-            # Gmail API doesn't have a true batch endpoint, but we can process in parallel
+            # For multiple emails, delete sequentially to avoid connection timeouts
             trashed_count = 0
             failed_count = 0
             errors = []
-            
-            # Use smaller batch size and add delays to avoid timeouts
-            # Process in smaller batches to reduce connection pressure
-            batch_size = min(10, len(valid_email_ids))  # Smaller batches for better reliability
-            for i in range(0, len(valid_email_ids), batch_size):
-                batch = valid_email_ids[i:i + batch_size]
-                
-                # Process batch with concurrent requests (but limit concurrency)
-                tasks = []
-                for eid in batch:
-                    tasks.append(self._trash_single_email(eid))
-                
-                # Execute batch concurrently with timeout handling
+
+            for eid in valid_email_ids:
                 try:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    # Process results
-                    for eid, result in zip(batch, results):
-                        if isinstance(result, Exception):
-                            logger.error(f"Error trashing email {eid}: {str(result)}")
-                            failed_count += 1
-                            errors.append(f"Email {eid}: {str(result)}")
-                        else:
-                            trashed_count += 1
-                except Exception as batch_error:
-                    logger.error(f"Batch processing error: {str(batch_error)}")
-                    # Mark all in batch as failed
-                    for eid in batch:
-                        failed_count += 1
-                        errors.append(f"Email {eid}: Batch error - {str(batch_error)}")
-                
-                # Add small delay between batches to avoid overwhelming the connection
-                if i + batch_size < len(valid_email_ids):
-                    await asyncio.sleep(0.1)  # 100ms delay between batches
+                    await self._trash_single_email(eid)
+                    trashed_count += 1
+                    # Tiny delay to be gentle on the API/connection
+                    await asyncio.sleep(0.05)
+                except Exception as e:
+                    logger.error(f"Error trashing email {eid}: {str(e)}")
+                    failed_count += 1
+                    errors.append(f"Email {eid}: {str(e)}")
             
             # Return detailed status for bulk operation
             return {
