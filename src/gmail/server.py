@@ -4,6 +4,8 @@ import os
 import asyncio
 import logging
 import base64
+import json
+import ast
 from email.message import EmailMessage
 from email.header import decode_header
 from base64 import urlsafe_b64decode
@@ -329,14 +331,139 @@ class GmailService:
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
         
-    async def trash_email(self, email_id: str) -> str:
-        """Moves email to trash given ID."""
+    def _flatten_email_ids(self, email_id: str | list) -> list[str]:
+        """Recursively flatten email IDs from nested structures into a flat list of strings."""
+        result = []
+        if isinstance(email_id, str):
+            # Single email ID
+            if email_id.strip():
+                result.append(email_id.strip())
+        elif isinstance(email_id, list):
+            # List of email IDs - recursively flatten
+            for item in email_id:
+                result.extend(self._flatten_email_ids(item))
+        else:
+            # Try to convert to string
+            if email_id:
+                result.append(str(email_id).strip())
+        return result
+
+    async def trash_email(self, email_id: str | list[str]) -> str | dict:
+        """Moves email(s) to trash given ID(s). Accepts either a single email_id or a list of email_ids.
+        Uses batch requests when multiple emails are provided for better performance."""
         try:
-            self.service.users().messages().trash(userId="me", id=email_id).execute()
-            logger.info(f"Email moved to trash: {email_id}")
-            return "Email moved to trash successfully."
+            logger.info(f"trash_email called with type: {type(email_id)}, value: {str(email_id)[:200]}")
+            
+            # Track if this was originally a single email ID
+            was_single = isinstance(email_id, str)
+            
+            # Flatten the email IDs using recursive function
+            email_ids = self._flatten_email_ids(email_id)
+            logger.info(f"After flattening: {len(email_ids)} email IDs found")
+            
+            if not email_ids:
+                logger.error(f"No email IDs after flattening. Input was: {type(email_id)}")
+                return "No email IDs provided."
+            
+            # Filter out empty strings and validate
+            valid_email_ids = []
+            for eid in email_ids:
+                if isinstance(eid, list):
+                    logger.error(f"Skipping invalid email ID (still a list): {eid}")
+                    continue
+                if not isinstance(eid, str) or not eid.strip():
+                    logger.error(f"Skipping invalid email ID: {eid} (type: {type(eid)})")
+                    continue
+                eid_clean = eid.strip()
+                # Final validation - ensure it's not a string representation of a list
+                if eid_clean.startswith('[') and eid_clean.endswith(']'):
+                    logger.error(f"Skipping invalid email ID (appears to be a list string): {eid_clean}")
+                    continue
+                valid_email_ids.append(eid_clean)
+            
+            if not valid_email_ids:
+                return "No valid email IDs provided."
+            
+            # If only one email, use simple API call
+            if len(valid_email_ids) == 1:
+                try:
+                    await asyncio.to_thread(
+                        self.service.users().messages().trash(userId="me", id=valid_email_ids[0]).execute
+                    )
+                    logger.info(f"Email moved to trash: {valid_email_ids[0]}")
+                    return "Email moved to trash successfully."
+                except Exception as e:
+                    logger.error(f"Error trashing email {valid_email_ids[0]}: {str(e)}")
+                    return f"Failed to move email to trash: {str(e)}"
+            
+            # For multiple emails, use batch processing with throttling
+            # Gmail API doesn't have a true batch endpoint, but we can process in parallel
+            trashed_count = 0
+            failed_count = 0
+            errors = []
+            
+            # Use smaller batch size and add delays to avoid timeouts
+            # Process in smaller batches to reduce connection pressure
+            batch_size = min(10, len(valid_email_ids))  # Smaller batches for better reliability
+            for i in range(0, len(valid_email_ids), batch_size):
+                batch = valid_email_ids[i:i + batch_size]
+                
+                # Process batch with concurrent requests (but limit concurrency)
+                tasks = []
+                for eid in batch:
+                    tasks.append(self._trash_single_email(eid))
+                
+                # Execute batch concurrently with timeout handling
+                try:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Process results
+                    for eid, result in zip(batch, results):
+                        if isinstance(result, Exception):
+                            logger.error(f"Error trashing email {eid}: {str(result)}")
+                            failed_count += 1
+                            errors.append(f"Email {eid}: {str(result)}")
+                        else:
+                            trashed_count += 1
+                except Exception as batch_error:
+                    logger.error(f"Batch processing error: {str(batch_error)}")
+                    # Mark all in batch as failed
+                    for eid in batch:
+                        failed_count += 1
+                        errors.append(f"Email {eid}: Batch error - {str(batch_error)}")
+                
+                # Add small delay between batches to avoid overwhelming the connection
+                if i + batch_size < len(valid_email_ids):
+                    await asyncio.sleep(0.1)  # 100ms delay between batches
+            
+            # Return detailed status for bulk operation
+            return {
+                'status': 'success' if failed_count == 0 else 'partial',
+                'trashed_count': trashed_count,
+                'failed_count': failed_count,
+                'total_count': len(valid_email_ids),
+                'message': f"Successfully trashed {trashed_count} out of {len(valid_email_ids)} email(s).",
+                'errors': errors if errors else None
+            }
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            error_msg = f"An HttpError occurred: {str(error)}"
+            if isinstance(email_id, list):
+                return {
+                    'status': 'error',
+                    'error_message': error_msg
+                }
+            return error_msg
+    
+    async def _trash_single_email(self, email_id: str) -> None:
+        """Helper method to trash a single email. Used for batch processing."""
+        try:
+            await asyncio.to_thread(
+                self.service.users().messages().trash(userId="me", id=email_id).execute
+            )
+            logger.info(f"Email moved to trash: {email_id}")
+        except Exception as e:
+            logger.error(f"Error in _trash_single_email for {email_id}: {str(e)}")
+            raise
         
     async def mark_email_as_read(self, email_id: str) -> str:
         """Marks email as read given ID."""
@@ -1213,14 +1340,26 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             ),
             types.Tool(
                 name="trash-email",
-                description="""Moves email to trash. 
-                Confirm before moving email to trash.""",
+                description="""Moves email(s) to trash. 
+                Accepts either a single email_id (string) or a list of email_ids (array).
+                Confirm before moving email(s) to trash.""",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "email_id": {
-                            "type": "string",
-                            "description": "Email ID",
+                            "oneOf": [
+                                {
+                                    "type": "string",
+                                    "description": "Single email ID",
+                                },
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    },
+                                    "description": "List of email IDs to trash in bulk",
+                                },
+                            ],
                         },
                     },
                     "required": ["email_id"],
@@ -1685,9 +1824,85 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             email_id = arguments.get("email_id")
             if not email_id:
                 raise ValueError("Missing email ID parameter")
-                
-            msg = await gmail_service.trash_email(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            
+            # Log the type to help debug
+            logger.info(f"trash-email received email_id type: {type(email_id)}, value: {email_id}")
+            
+            # Handle different input formats
+            # MCP protocol might pass arrays as lists, tuples, or JSON strings
+            original_type = type(email_id)
+            original_value = str(email_id)[:200]  # Limit length for logging
+            
+            if isinstance(email_id, (list, tuple)):
+                logger.info(f"Detected list/tuple type, length: {len(email_id)}")
+                # Already a list/tuple - convert tuple to list and process
+                email_id = list(email_id) if isinstance(email_id, tuple) else email_id
+                # Validate list contents
+                processed_list = []
+                for idx, item in enumerate(email_id):
+                    logger.debug(f"Processing item {idx}: type={type(item)}, value={str(item)[:50]}")
+                    if isinstance(item, str) and item.strip():
+                        processed_list.append(item.strip())
+                    elif isinstance(item, (list, tuple)):
+                        # Nested list/tuple - flatten it
+                        processed_list.extend([str(x).strip() for x in item if x and str(x).strip()])
+                    elif item:
+                        processed_list.append(str(item).strip())
+                logger.info(f"Processed list: {len(processed_list)} valid items from {len(email_id)} items")
+                email_id = processed_list if processed_list else email_id
+                if not processed_list:
+                    logger.error(f"No valid email IDs after processing. Original: {original_type}, First item type: {type(email_id[0]) if email_id else 'N/A'}")
+            elif isinstance(email_id, str):
+                # Check if it's a JSON string representation of an array
+                email_id_str = email_id.strip()
+                if email_id_str.startswith('[') and email_id_str.endswith(']'):
+                    # Try JSON parsing first (double quotes)
+                    try:
+                        parsed = json.loads(email_id_str)
+                        if isinstance(parsed, list):
+                            email_id = [str(x).strip() for x in parsed if x and str(x).strip()]
+                            logger.info(f"Parsed JSON string to list: {email_id}")
+                        else:
+                            # Single value in JSON, treat as single email
+                            email_id = str(parsed).strip()
+                    except (json.JSONDecodeError, ValueError):
+                        # Try parsing as Python list string (single quotes)
+                        # This handles cases like "['id1', 'id2']"
+                        try:
+                            # Use ast.literal_eval for safe evaluation of Python literals
+                            parsed = ast.literal_eval(email_id_str)
+                            if isinstance(parsed, list):
+                                email_id = [str(x).strip() for x in parsed if x and str(x).strip()]
+                                logger.info(f"Parsed Python list string to list: {email_id}")
+                            else:
+                                email_id = str(parsed).strip()
+                        except (ValueError, SyntaxError):
+                            # Not valid JSON or Python list, treat as single email ID
+                            logger.warning(f"Could not parse as array, treating as single email ID: {email_id_str[:100]}")
+                            email_id = email_id_str
+                else:
+                    # Single email ID string
+                    email_id = email_id_str
+            
+            # Final validation before calling trash_email
+            if isinstance(email_id, list) and len(email_id) == 0:
+                logger.error("No valid email IDs after processing")
+                return [types.TextContent(type="text", text="No valid email IDs provided after processing.")]
+            
+            if isinstance(email_id, str) and not email_id.strip():
+                logger.error("Empty email ID string")
+                return [types.TextContent(type="text", text="No valid email ID provided.")]
+            
+            logger.info(f"Calling trash_email with final type: {type(email_id)}, count: {len(email_id) if isinstance(email_id, list) else 'single'}")
+            result = await gmail_service.trash_email(email_id)
+            # If result is a dict (bulk operation), format it nicely
+            if isinstance(result, dict):
+                response_text = result.get('message', str(result))
+                if result.get('errors'):
+                    response_text += f"\nErrors: {', '.join(result['errors'])}"
+            else:
+                response_text = str(result)
+            return [types.TextContent(type="text", text=response_text)]
         if name == "mark-email-as-read":
             email_id = arguments.get("email_id")
             if not email_id:
